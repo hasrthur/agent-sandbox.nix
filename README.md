@@ -37,6 +37,7 @@ Everything else is denied. Only changes to the launch directory and declared rwD
 * [Authentication](#authentication)
     * [Environment variable tokens (recommended)](#environment-variable-tokens-recommended)
     * [Credential files via `rwDirs`](#credential-files-via-rwdirs)
+    * [Masked credentials](#masked-credentials)
 * [Git](#git)
     * [Setting your git identity](#setting-your-git-identity)
     * [What the sandbox exposes](#what-the-sandbox-exposes)
@@ -134,6 +135,7 @@ Set `CLAUDE_CONFIG_DIR` to `$HOME/.claude`, so that Claude writes `~/.claude.jso
 | `roDirs` | no | Directories the agent can read but not write (for example signed binaries, reference source trees, secret stores) |
 | `roFiles` | no | Individual files the agent can read but not write (for example `~/.config/git/config` for the git identity, see [Setting your git identity](#setting-your-git-identity) |
 | `env` | no | Additional environment variables, as an attrset |
+| `maskedCredentials` | no | Environment variables whose real value the agent must not hold, as an attrset mapping each name to the list of hosts its value may be substituted for. The sandbox receives a per-session phantom of the same byte length and the proxy swaps the real value in on the way out. Requires `allowedDomains`. See [Masked credentials](#masked-credentials). |
 | `allowedDomains` | no | Limits the domains the sandbox can reach. Leave it unset for open internet. Accepts a list of domains (all methods allowed), or an attrset that maps each domain to `"*"` or to a list of HTTP methods. `[ ]` blocks all internet access. |
 | `allowUnixSockets` | no | If `true`, the agent can create and connect to UNIX-domain (AF_UNIX) sockets. It can connect in directories it can read, and bind in directories it can write. Defaults to `false`. See [UNIX-domain sockets](#unix-domain-sockets). |
 | `allowedHostPorts` | no | Host-local TCP ports the sandbox can reach. Defaults to `[ ]`. Set it to `null` to allow all host-local TCP ports. Otherwise, entries must be integers from `1` to `65535`. |
@@ -348,6 +350,60 @@ Note: OAuth access tokens expire. Run the export command again from time to time
 
 </details>
 
+### Masked credentials
+
+Both methods above hand the real token to the agent. `maskedCredentials` does not. The sandbox receives a phantom, and the proxy swaps the real value in on the way out, for the hosts you name and no others. An agent that reads its own environment, prints it, or sends the token somewhere unexpected gets an inert string.
+
+Name the variable and the hosts its value may be used on:
+
+```nix
+maskedCredentials = {
+  GITHUB_TOKEN = [ "github.com" "api.github.com" ];
+};
+```
+
+Export the token in the host terminal as you would for any other method, and launch. Nothing else is required: the variable reaches the sandbox under its own name, carrying a phantom of the real value's exact byte length, minted fresh for each session.
+
+```
+export GITHUB_TOKEN="<your_token_here>"
+```
+
+Do not also declare the name in `env` — the sandbox would then be given the value twice, and the build refuses it.
+
+This needs `allowedDomains`, because substitution happens in the proxy that setting starts, and it covers the headers of HTTPS requests through that proxy.
+
+Only the variable's *name* is a Nix value. The token itself is read from your shell at launch, so it is never written to the world-readable Nix store, never passed on a command line where the process table would expose it, and never written to disk.
+
+Four properties are worth knowing before you rely on it:
+
+- The proxy only ever replaces, and never adds. A request that does not carry the phantom does not get a credential. A failure to match therefore means the phantom travels on and authentication fails at the far end — it does not mean the real value leaks.
+- The host list fails closed. A phantom sent to a host you did not list travels on unchanged, so an agent cannot collect a credential by sending it to a host of its own choosing.
+- The host that decides is the one from the CONNECT, the name the allowlist checked, not the `Host` header of the request inside the tunnel.
+- The phantom matches the real value's byte length, so substitution leaves every request's framing unchanged.
+
+**Encoded credentials are covered without being configured.** Git over HTTPS does not send a bare token: it sends `Authorization: Basic <base64 of "x-access-token:<token>">`, in which the token appears nowhere literally. The proxy decodes a `Basic` value, substitutes inside it, and re-encodes, so this works with no configuration naming basic auth, and with whatever username the provider expects — `x-access-token` for GitHub, `oauth2` for GitLab, or the token in the username slot with no password, as several APIs take it. A value that does not re-encode to exactly what arrived is left alone rather than rewritten.
+
+**What is not substituted.** Request bodies, URLs and query strings are not scanned. Neither is plaintext HTTP, where a real credential would cross the wire in the clear. Each of these leaves the phantom in place, so the request fails to authenticate rather than leaking anything.
+
+<details>
+<summary><strong>Driving the proxy directly, without <code>maskedCredentials</code></strong></summary>
+
+`maskedCredentials` is a front end for `SANDBOX_PROXY_CREDENTIALS`, which the launcher exports for the proxy. It holds a JSON array, read once at proxy startup, and can be set by hand if you are minting phantoms elsewhere:
+
+```
+[
+  { "phantom": "<inert value the client sends>",
+    "real":    "<value the proxy substitutes>",
+    "hosts":   ["github.com"] }
+]
+```
+
+A credential whose `hosts` is empty or absent is substitutable nowhere. A malformed declaration stops the proxy at startup rather than being skipped, so a typo surfaces as a launch failure rather than as an authentication error later; the error names the index of the entry it rejected and never its contents. No header value and no credential reaches `proxy.log` at any verbosity.
+
+Give the phantom the same byte length as the real value. Nothing enforces it here, and an unequal length changes the length of every header the credential appears in.
+
+</details>
+
 ## Git
 
 Local git operations work with no extra configuration. The agent can switch branches, read history, and commit. A commit needs a declared git identity.
@@ -546,7 +602,7 @@ The sandbox is an isolation boundary. It is not an anonymity boundary, and it is
 - With `allowNix = true`, all of `/nix/store` is readable and executable, not only your allowed packages, so the agent can list every package you have built. The Nix store is normally world-readable on any system, so this matches existing behavior.See [Using Nix inside the sandbox](#using-nix-inside-the-sandbox).
 - A launch from a subdirectory does not limit reads to that subdirectory. The agent can read the whole working tree that contains it. See [What the sandbox exposes](#what-the-sandbox-exposes).
 - The agent can read all of the git directory. This includes every branch, stash and reflog entry, also content that is no longer in the working tree.
-- The agent has everything you hand it. If you expose your `~/.claude` directory (or any credential file) through `rwDirs`, or pass a token through `env`, the agent can read it. That is how it logs in. A compromised agent has the same access to those credentials as your shell. Treat this the way you would treat handing the token to any other CLI tool you did not write yourself.
+- The agent has everything you hand it. If you expose your `~/.claude` directory (or any credential file) through `rwDirs`, or pass a token through `env`, the agent can read it. That is how it logs in. A compromised agent has the same access to those credentials as your shell. Treat this the way you would treat handing the token to any other CLI tool you did not write yourself. A token reached over HTTPS through the proxy is the exception you can close: see [Masked credentials](#masked-credentials).
 - The agent can edit its own sandbox config. `flake.nix` lives inside the project directory, and the sandbox permits writes to it. An agent could weaken its own restrictions for the next session. The changes take effect only when you enter the dev shell again, so it is worth reading `git diff` first.
 - The sandbox protects only the repo you launch in from git hook injection. It does not protect other repos that sit under your launch directory. A nested repo is writable like anything else there, and this includes its hooks.
 - The sandbox is no defense against root access or kernel bugs. If something on your machine has already gained administrator-level access, or the operating system itself has a deeper bug, this sandbox cannot stop it.

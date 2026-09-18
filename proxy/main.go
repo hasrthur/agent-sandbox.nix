@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -38,6 +39,64 @@ type Config map[string]DomainPolicy
 // proxy dials instead of resolving the original host. A test-harness escape
 // hatch, set via SANDBOX_PROXY_REDIRECT as "host=addr:port[,...]".
 type Redirects map[string]string
+
+// Credential is an inert value the client holds, the real value it stands for,
+// and the hosts that exchange is permitted for. Hosts carries no entry unless
+// one was declared, so a credential naming none is substitutable nowhere: the
+// opposite default would make every allowlisted host a place to collect it.
+type Credential struct {
+	Phantom string
+	Real    string
+	Hosts   map[string]bool
+}
+
+type Credentials []Credential
+
+// Declared credentials, read once at startup and only read afterwards. A
+// package-level value rather than an argument threaded through serve and
+// handle, as clientHandshakeTimeout above.
+var credentials Credentials
+
+// parseCredentialEnv reads SANDBOX_PROXY_CREDENTIALS, a JSON array of
+// {"phantom","real","hosts"} objects. JSON rather than the "k=v,..." form
+// parseRedirectEnv takes, because a credential travels base64-encoded and
+// base64 pads with "=", which that form rejects.
+//
+// No error names the entry it rejected — the proxy's stderr is its log.
+func parseCredentialEnv(s string) (Credentials, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	var raw []struct {
+		Phantom string   `json:"phantom"`
+		Real    string   `json:"real"`
+		Hosts   []string `json:"hosts"`
+	}
+	if err := json.Unmarshal([]byte(s), &raw); err != nil {
+		return nil, errors.New(`expected a JSON array of {"phantom","real","hosts"} objects`)
+	}
+	out := make(Credentials, 0, len(raw))
+	for i, entry := range raw {
+		// An empty phantom matches between every byte of every header value,
+		// splicing the real credential across the whole request.
+		if entry.Phantom == "" {
+			return nil, fmt.Errorf("credential %d: empty phantom", i)
+		}
+		if entry.Real == "" {
+			return nil, fmt.Errorf("credential %d: empty real value", i)
+		}
+		hosts := make(map[string]bool, len(entry.Hosts))
+		for _, host := range entry.Hosts {
+			host = normaliseHost(strings.TrimSpace(host))
+			if host == "" {
+				return nil, fmt.Errorf("credential %d: empty host", i)
+			}
+			hosts[host] = true
+		}
+		out = append(out, Credential{Phantom: entry.Phantom, Real: entry.Real, Hosts: hosts})
+	}
+	return out, nil
+}
 
 // lowerASCII folds only ASCII, where strings.ToLower folds Unicode: under a
 // Unicode fold U+212A KELVIN SIGN lowercases to "k" and U+0130 to "i", so a
@@ -491,6 +550,70 @@ func applyFilters(req *http.Request, host string, cfg Config) (int, string) {
 	return 0, ""
 }
 
+// substituteCredentials replaces each phantom with the value it stands for, in
+// every header value, for the hosts that credential declares and no others. It
+// never adds one: a phantom the client did not send cannot be swapped, so a
+// host matching nothing receives the inert value and authentication fails
+// there rather than a secret travelling to it.
+//
+// host is the name the connection was gated for, not the Host header of the
+// request inside the tunnel. Keying on the inner value would let a client
+// tunnel to any allowlisted host, name a declared one inside it, and collect
+// that host's credential.
+//
+// Every value is scanned rather than a list of header names, and matched as a
+// substring, so a credential carried inside a larger value is still found.
+func substituteCredentials(header http.Header, host string, creds Credentials) {
+	host = normaliseHost(host)
+	for _, cred := range creds {
+		if !cred.Hosts[host] {
+			continue
+		}
+		for _, values := range header {
+			for i, value := range values {
+				value = strings.ReplaceAll(value, cred.Phantom, cred.Real)
+				values[i] = substituteBasicAuth(value, cred)
+			}
+		}
+	}
+}
+
+// substituteBasicAuth rewrites a credential carried inside an HTTP Basic
+// value, where base64 hides it from the scan above.
+//
+// Decoded rather than matched against a pre-encoded form, so that nothing has
+// to be configured with the username a given provider expects. That matters
+// because base64 packs three bytes into four characters: the encoding of a
+// token is a substring of the encoding of "<username>:<token>" only when the
+// username's length divides by three. It does for GitHub's "x-access-token"
+// (15 bytes) and does not for GitLab's "oauth2" (7), so a pre-encoded form
+// would work for one provider and silently fail for the next.
+//
+// Length is preserved, since equal-length inputs encode to equal-length
+// output, and a value that does not re-encode to exactly what arrived is left
+// alone rather than rewritten from a reading of it that upstream may not share.
+func substituteBasicAuth(value string, cred Credential) string {
+	const scheme = "Basic "
+	if len(value) < len(scheme) || !strings.EqualFold(value[:len(scheme)], scheme) {
+		return value
+	}
+	// Carried through rather than re-emitted from the constant, so a client
+	// that spelled the scheme its own way gets its own bytes back.
+	prefix, encoded := value[:len(scheme)], value[len(scheme):]
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return value
+	}
+	if base64.StdEncoding.EncodeToString(decoded) != encoded {
+		return value
+	}
+	replaced := strings.ReplaceAll(string(decoded), cred.Phantom, cred.Real)
+	if replaced == string(decoded) {
+		return value
+	}
+	return prefix + base64.StdEncoding.EncodeToString([]byte(replaced))
+}
+
 // Assembled before writing because w is a TLS connection, which emits a record
 // per Write, and Header.Write issues four per header. Clients that count small
 // reads to spot a slow-drip attack reject a handshake split that finely.
@@ -624,6 +747,15 @@ func main() {
 	redirects, err := parseRedirectEnv(os.Getenv("SANDBOX_PROXY_REDIRECT"))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "parse SANDBOX_PROXY_REDIRECT:", err)
+		os.Exit(1)
+	}
+
+	// Refusing to start rather than running without it: a declaration that is
+	// silently skipped sends the phantom onward, which fails authentication
+	// somewhere far from the mistake.
+	credentials, err = parseCredentialEnv(os.Getenv("SANDBOX_PROXY_CREDENTIALS"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "parse SANDBOX_PROXY_CREDENTIALS:", err)
 		os.Exit(1)
 	}
 
@@ -780,6 +912,10 @@ func handle(conn net.Conn, cfg Config, ca *certAuthority, redirects Redirects) {
 			}
 			req.URL.Host = vetted
 		}
+		// Deliberately not credentialed, unlike the MITM path below: this one
+		// is plaintext, and a real credential written to it crosses the wire
+		// in the clear. A phantom sent here travels inert, as it does to any
+		// undeclared host.
 		req.RequestURI = "" // Must be empty for RoundTrip
 		resp, err := directTransport.RoundTrip(req)
 		if err != nil {
@@ -900,6 +1036,9 @@ func handleMITM(clientConn net.Conn, host, hostPort string, cfg Config, ca *cert
 		req.URL.Scheme = ""
 		req.URL.Host = ""
 		req.RequestURI = req.URL.RequestURI()
+		// Between the filter's approval and the write, so a blocked request is
+		// never credentialed and substitution cannot reach a refused host.
+		substituteCredentials(req.Header, host, credentials)
 		if err := req.Write(upstreamConn); err != nil {
 			fmt.Fprintf(os.Stderr, "%s upstream write error for %s: %v\n", time.Now().Format(time.RFC3339), host, err)
 			return

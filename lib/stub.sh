@@ -9,6 +9,8 @@ set -uo pipefail
 
 DECLARED_ENV=()
 UNRESOLVED=()
+CREDENTIALS=()
+UNMASKABLE=()
 
 # The declared env values are runtime shell expressions; they expand here and
 # never enter Python or touch disk. The expansion runs inside a command
@@ -21,6 +23,63 @@ declare_env() {
   else
     UNRESOLVED+=("$name = $expression")
   fi
+}
+
+PHANTOM_ALPHABET='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+
+# A random string of exactly $1 bytes. Alphanumeric, so it carries no character
+# with meaning in a header, a URL, a shell word or the JSON below. The entropy
+# is what keeps a phantom from occurring by accident in content the proxy
+# scans, where a collision would splice the real credential into whatever
+# contained it.
+#
+# $SRANDOM, not $RANDOM, which is a seeded 15-bit PRNG. Pure bash, so this adds
+# no dependency on a PATH the stub deliberately does not trust: every other
+# external it runs is pinned to a store path. The modulo bias over 62 is about
+# two parts in a hundred thousand, against a value tens of characters long.
+mint_phantom() {
+  local length=$1 out=''
+  while ((${#out} < length)); do
+    out+=${PHANTOM_ALPHABET:SRANDOM % ${#PHANTOM_ALPHABET}:1}
+  done
+  printf '%s' "$out"
+}
+
+# Masks one credential: the sandbox receives a phantom of the real value's
+# exact byte length, which keeps every request's framing unchanged, and the
+# proxy is told to swap the real value back in for the declared hosts.
+#
+# The real value stays in this shell and the proxy's inherited environment. It
+# is never written to disk, never passed on a command line, and never added to
+# DECLARED_ENV, which is the only thing that crosses into the sandbox.
+mask_env() {
+  local name=$1 expression=$2 hosts=$3 value phantom quoted_hosts
+  if ! value=$(eval "printf '%s' $expression" 2>/dev/null); then
+    UNRESOLVED+=("$name = $expression")
+    return
+  fi
+  # Refused rather than escaped: a value carrying either would have to be
+  # quoted into the JSON below, and a credential is the wrong place to find out
+  # that the quoting was wrong.
+  case $value in
+  *\"* | *\\* | *$'\n'*)
+    UNMASKABLE+=("$name")
+    return
+    ;;
+  esac
+  if ! phantom=$(mint_phantom "${#value}"); then
+    UNMASKABLE+=("$name")
+    return
+  fi
+  DECLARED_ENV+=("$name=$phantom")
+  quoted_hosts=$(
+    IFS=,
+    for host in $hosts; do
+      printf '%s"%s"' "${sep-}" "$host"
+      sep=,
+    done
+  )
+  CREDENTIALS+=("{\"phantom\":\"$phantom\",\"real\":\"$value\",\"hosts\":[$quoted_hosts]}")
 }
 
 # shellcheck source=/dev/null
@@ -38,6 +97,32 @@ if ((${#UNRESOLVED[@]})); then
     echo "references must be set in the shell you launch from."
   } >&2
   exit 1
+fi
+
+if ((${#UNMASKABLE[@]})); then
+  {
+    echo "@errorPrefix@ could not mask these credentials:"
+    echo
+    for entry in "${UNMASKABLE[@]}"; do
+      echo "  $entry"
+    done
+    echo
+    echo "A masked value must not contain a double quote, a backslash or a"
+    echo "newline. The value itself is not shown, because this message is"
+    echo "printed to a terminal."
+  } >&2
+  exit 1
+fi
+
+# Exported rather than declared, so it reaches the proxy through the
+# environment the launcher hands it and never crosses into the sandbox, whose
+# environment is rebuilt from DECLARED_ENV alone.
+if ((${#CREDENTIALS[@]})); then
+  SANDBOX_PROXY_CREDENTIALS="[$(
+    IFS=,
+    printf '%s' "${CREDENTIALS[*]}"
+  )]"
+  export SANDBOX_PROXY_CREDENTIALS
 fi
 
 # Exported so the entry point inside pasta's namespace inherits it too;
