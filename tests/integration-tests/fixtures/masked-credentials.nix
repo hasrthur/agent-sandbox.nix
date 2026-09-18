@@ -27,6 +27,13 @@ sandbox.mkSandbox {
   maskedCredentials = {
     TEST_TOKEN = [ "httpbin.test" ];
   };
+  # A second name carrying the same credential, the shape an authorization
+  # header computed from a token has. It must be built from the phantom: were
+  # it built from the real value, the sandbox would hold the credential under
+  # this name and masking the first would be decorative.
+  env = {
+    TEST_TOKEN_HEADER = "Bearer $TEST_TOKEN";
+  };
   _proxyRedirects = {
     "httpbin.test" = "127.0.0.1:${httpbinPort}";
     "pie.test" = "127.0.0.1:${httpbinPort}";

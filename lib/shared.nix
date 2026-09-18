@@ -248,21 +248,27 @@ let
       maskedCredentials ? { },
     }:
     pkgs.writeText "${outName}-env" (
-      pkgs.lib.concatMapStrings (
-        name:
-        "declare_env ${pkgs.lib.escapeShellArg name} ${
-          pkgs.lib.escapeShellArg (builtins.toJSON env.${name})
-        }\n"
-      ) (builtins.attrNames env)
+      # Masked first, and this order is load-bearing: mask_env exports the
+      # phantom under its own name, so an env value below that derives from a
+      # masked credential — an authorization header computed from a token —
+      # expands to the phantom rather than to the real value, and the derived
+      # name carries nothing the sandbox may not hold.
+      #
       # The value is read from the launching shell by the same expansion
       # declare_env uses, so that what a masked variable names is what an
       # unmasked one would have carried.
-      + pkgs.lib.concatMapStrings (
+      pkgs.lib.concatMapStrings (
         name:
         "mask_env ${pkgs.lib.escapeShellArg name} ${
           pkgs.lib.escapeShellArg (builtins.toJSON ("$" + name))
         } ${pkgs.lib.escapeShellArg (builtins.concatStringsSep "," maskedCredentials.${name})}\n"
       ) (builtins.attrNames maskedCredentials)
+      + pkgs.lib.concatMapStrings (
+        name:
+        "declare_env ${pkgs.lib.escapeShellArg name} ${
+          pkgs.lib.escapeShellArg (builtins.toJSON env.${name})
+        }\n"
+      ) (builtins.attrNames env)
     );
 
   mkStub =

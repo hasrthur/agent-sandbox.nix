@@ -76,6 +76,24 @@ else
 fi
 
 echo
+echo "--- an env value derived from a masked credential ---"
+
+capture "$SHELL_BIN" --norc --noprofile -c 'printf "%s" "$TEST_TOKEN_HEADER"'
+assert_output_not_contains "a derived env value does not carry the real value" \
+	"ghp_realvalue_never_reaches_the_sandbox_01"
+
+# Compared inside the sandbox, which is the only place both names are readable.
+capture "$SHELL_BIN" --norc --noprofile -c \
+	'if [[ $TEST_TOKEN_HEADER == "Bearer $TEST_TOKEN" ]]; then printf phantom; else printf something-else; fi'
+assert_output_equals "a derived env value carries this session's phantom" "phantom"
+
+capture "$SHELL_BIN" --norc --noprofile -c \
+	'curl -sf --max-time 10 -H "Authorization: $TEST_TOKEN_HEADER" https://httpbin.test/headers'
+assert_exit_code "a request carrying the derived name succeeds" 0
+assert_output_contains "the declared host received the real value through the derived name" \
+	"Bearer ghp_realvalue_never_reaches_the_sandbox_01"
+
+echo
 echo "--- what the upstream received ---"
 
 # httpbin's /headers echoes the request headers it was sent.

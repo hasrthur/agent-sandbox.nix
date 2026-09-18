@@ -72,6 +72,9 @@ mask_env() {
     return
   fi
   DECLARED_ENV+=("$name=$phantom")
+  # Replaced in this shell too, so an env value declared from this name — an
+  # authorization header computed from a token — is built from the phantom.
+  export "$name=$phantom"
   quoted_hosts=$(
     IFS=,
     for host in $hosts; do
