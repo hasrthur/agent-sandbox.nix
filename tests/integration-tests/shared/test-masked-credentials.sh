@@ -96,26 +96,27 @@ assert_output_contains "the declared host received the real value through the de
 echo
 echo "--- what the upstream received ---"
 
-# httpbin's /headers echoes the request headers it was sent.
+# httpbin's /headers echoes the request headers it was sent. The phantom is
+# rewritten to a marker inside the sandbox, the only place it is readable, so no
+# run can put it in a CI log — and so a substitution that appended rather than
+# replaced leaves the marker behind instead of passing unnoticed.
 capture "$SHELL_BIN" --norc --noprofile -c \
-	'curl -sf --max-time 10 -H "Authorization: Bearer $TEST_TOKEN" https://httpbin.test/headers'
+	'r=$(curl -sf --max-time 10 -H "Authorization: Bearer $TEST_TOKEN" https://httpbin.test/headers) || exit
+	 printf "%s" "${r//"$TEST_TOKEN"/PHANTOM}"'
 assert_exit_code "a request to the declared host succeeds" 0
 assert_output_contains "the declared host received the real value" \
 	"Bearer ghp_realvalue_never_reaches_the_sandbox_01"
+assert_output_not_contains "the declared host received no phantom" "PHANTOM"
 
+# The phantom travels on to a host the credential does not name, so the request
+# is inert there rather than refused.
 capture "$SHELL_BIN" --norc --noprofile -c \
-	'curl -sf --max-time 10 -H "Authorization: Bearer $TEST_TOKEN" https://pie.test/headers'
+	'r=$(curl -sf --max-time 10 -H "Authorization: Bearer $TEST_TOKEN" https://pie.test/headers) || exit
+	 printf "%s" "${r//"$TEST_TOKEN"/PHANTOM}"'
 assert_exit_code "a request to the undeclared host succeeds" 0
 assert_output_not_contains "the undeclared host did not receive the real value" \
 	"ghp_realvalue_never_reaches_the_sandbox_01"
-
-# The phantom travels on to a host the credential does not name, so the request
-# is inert there rather than refused. Compared inside the sandbox, because the
-# phantom is minted per session and the harness never learns it.
-capture "$SHELL_BIN" --norc --noprofile -c \
-	'r=$(curl -sf --max-time 10 -H "Authorization: Bearer $TEST_TOKEN" https://pie.test/headers)
-	 if [[ $r == *"$TEST_TOKEN"* ]]; then printf phantom; else printf something-else; fi'
-assert_output_equals "the undeclared host received the phantom instead" "phantom"
+assert_output_contains "the undeclared host received the phantom instead" "PHANTOM"
 
 echo
 echo "--- the encoded form, which no configuration names ---"
@@ -149,6 +150,29 @@ capture "$SHELL_BIN" --norc --noprofile -c \
 	'curl -sf --max-time 10 -u "x-access-token:$TEST_TOKEN" https://pie.test/headers'
 assert_output_not_contains "the undeclared host received no encoded credential either" \
 	"$EXPECTED_BASIC"
+
+echo
+echo "--- the phantom carried in a request body ---"
+
+# text/plain because go-httpbin echoes a body sent under a binary content type
+# back as a base64 data: URI, which no literal assertion here would match.
+capture "$SHELL_BIN" --norc --noprofile -c \
+	'r=$(curl -sf --max-time 10 -X POST -H "Content-Type: text/plain" \
+		--data-binary "$TEST_TOKEN" https://httpbin.test/post) || exit
+	 printf "%s" "${r//"$TEST_TOKEN"/PHANTOM}"'
+assert_exit_code "a request carrying the phantom in its body succeeds" 0
+assert_output_contains "the declared host received the real value in the body" \
+	"ghp_realvalue_never_reaches_the_sandbox_01"
+assert_output_not_contains "the declared host received no phantom in the body" "PHANTOM"
+
+capture "$SHELL_BIN" --norc --noprofile -c \
+	'r=$(curl -sf --max-time 10 -X POST -H "Content-Type: text/plain" \
+		--data-binary "$TEST_TOKEN" https://pie.test/post) || exit
+	 printf "%s" "${r//"$TEST_TOKEN"/PHANTOM}"'
+assert_exit_code "a request carrying the phantom in its body to the undeclared host succeeds" 0
+assert_output_not_contains "the undeclared host did not receive the real value in the body" \
+	"ghp_realvalue_never_reaches_the_sandbox_01"
+assert_output_contains "the undeclared host received the body phantom unsubstituted" "PHANTOM"
 
 echo
 echo "--- the proxy log ---"
