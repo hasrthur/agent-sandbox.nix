@@ -370,7 +370,7 @@ export GITHUB_TOKEN="<your_token_here>"
 
 Do not also declare the name in `env` — the sandbox would then be given the value twice, and the build refuses it.
 
-This needs `allowedDomains`, because substitution happens in the proxy that setting starts, and it covers the headers of HTTPS requests through that proxy.
+This needs `allowedDomains`, because substitution happens in the proxy that setting starts, and it covers the headers and bodies of HTTPS requests through that proxy.
 
 Only the variable's *name* is a Nix value. The token itself is read from your shell at launch, so it is never written to the world-readable Nix store, never passed on a command line where the process table would expose it, and never written to disk.
 
@@ -383,7 +383,9 @@ Four properties are worth knowing before you rely on it:
 
 **Encoded credentials are covered without being configured.** Git over HTTPS does not send a bare token: it sends `Authorization: Basic <base64 of "x-access-token:<token>">`, in which the token appears nowhere literally. The proxy decodes a `Basic` value, substitutes inside it, and re-encodes, so this works with no configuration naming basic auth, and with whatever username the provider expects — `x-access-token` for GitHub, `oauth2` for GitLab, or the token in the username slot with no password, as several APIs take it. A value that does not re-encode to exactly what arrived is left alone rather than rewritten.
 
-**What is not substituted.** Request bodies, URLs and query strings are not scanned. Neither is plaintext HTTP, where a real credential would cross the wire in the clear. Each of these leaves the phantom in place, so the request fails to authenticate rather than leaking anything.
+**Request bodies are covered too.** A phantom carried in a body — a JSON field, a form field, a multipart part — is substituted under the same rules as one in a header: the same host list, the same fail-closed default, the same host from the CONNECT. The body is never gathered to scan it, so a `git push` of any size streams through; the scan is over raw bytes, and a phantom is alphanumeric, so no body format needs parsing.
+
+**What is not substituted.** URLs and query strings are not scanned. Neither is a body carrying a `Content-Encoding`, which the byte scan cannot see through — that one is logged, naming the host. Neither is plaintext HTTP, where a real credential would cross the wire in the clear. Each of these leaves the phantom in place, so the request fails to authenticate rather than leaking anything.
 
 <details>
 <summary><strong>Driving the proxy directly, without <code>maskedCredentials</code></strong></summary>
@@ -400,7 +402,7 @@ Four properties are worth knowing before you rely on it:
 
 A credential whose `hosts` is empty or absent is substitutable nowhere. A malformed declaration stops the proxy at startup rather than being skipped, so a typo surfaces as a launch failure rather than as an authentication error later; the error names the index of the entry it rejected and never its contents. No header value and no credential reaches `proxy.log` at any verbosity.
 
-Give the phantom the same byte length as the real value. Nothing enforces it here, and an unequal length changes the length of every header the credential appears in.
+Give the phantom the same byte length as the real value. Nothing enforces it here, and an unequal length changes the length of every header the credential appears in. A body is re-framed as chunked when any credential applicable to the host has unequal lengths, since the declared `Content-Length` could no longer hold.
 
 </details>
 
