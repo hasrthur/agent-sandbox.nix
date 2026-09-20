@@ -120,6 +120,44 @@ let
         builtins.throw "${errorPrefix} _proxyRedirects hosts must not contain \",\" or \"=\", and addresses must not contain \",\". Invalid: ${builtins.toJSON invalid}"
       else
         proxyRedirects;
+
+  # Only the variable's name is a Nix value here. Its contents are read at
+  # launch from the shell, so a credential never reaches the world-readable
+  # store.
+  validateMaskedCredentials =
+    { maskedCredentials, env }:
+    if !(builtins.isAttrs maskedCredentials) then
+      builtins.throw "${errorPrefix} maskedCredentials must be an attrset mapping an environment variable name to the list of hosts it may be substituted for"
+    else
+      let
+        names = builtins.attrNames maskedCredentials;
+        validName = name: builtins.match "[A-Za-z_][A-Za-z0-9_]*" name != null;
+        # The launcher joins these into one JSON list per credential, so a
+        # host carrying a quote would forge an entry no caller wrote.
+        validHost = host: builtins.isString host && builtins.match "[A-Za-z0-9.:_-]+" host != null;
+        isList = hosts: builtins.isList hosts;
+        badNames = builtins.filter (name: !(validName name)) names;
+        emptyHosts = builtins.filter (
+          name: !(isList maskedCredentials.${name}) || maskedCredentials.${name} == [ ]
+        ) names;
+        badHosts = builtins.filter (
+          name: isList maskedCredentials.${name} && !(builtins.all validHost maskedCredentials.${name})
+        ) names;
+        # Both would declare the same name, and which one reached the sandbox
+        # would depend on the order the launcher happened to emit them in.
+        clashing = builtins.filter (name: builtins.hasAttr name env) names;
+      in
+      if badNames != [ ] then
+        builtins.throw "${errorPrefix} maskedCredentials names must be environment variable names. Invalid: ${builtins.toJSON badNames}"
+      else if emptyHosts != [ ] then
+        builtins.throw "${errorPrefix} each maskedCredentials entry must be a non-empty list of hosts; an empty list would mask the credential without it being usable anywhere. Invalid: ${builtins.toJSON emptyHosts}"
+      else if badHosts != [ ] then
+        builtins.throw "${errorPrefix} maskedCredentials hosts must be hostnames, containing only letters, digits and \".:_-\". Invalid: ${builtins.toJSON badHosts}"
+      else if clashing != [ ] then
+        builtins.throw "${errorPrefix} these names are declared in both env and maskedCredentials, which would set them twice: ${builtins.toJSON clashing}"
+      else
+        maskedCredentials;
+
   assertNoLegacyArgs =
     {
       restrictNetwork,
@@ -204,9 +242,28 @@ let
   # word; escapeShellArg carries the fragment through unexpanded until
   # declare_env evals it.
   mkEnvFragment =
-    { outName, env }:
+    {
+      outName,
+      env,
+      maskedCredentials ? { },
+    }:
     pkgs.writeText "${outName}-env" (
+      # Masked first, and this order is load-bearing: mask_env exports the
+      # phantom under its own name, so an env value below that derives from a
+      # masked credential — an authorization header computed from a token —
+      # expands to the phantom rather than to the real value, and the derived
+      # name carries nothing the sandbox may not hold.
+      #
+      # The value is read from the launching shell by the same expansion
+      # declare_env uses, so that what a masked variable names is what an
+      # unmasked one would have carried.
       pkgs.lib.concatMapStrings (
+        name:
+        "mask_env ${pkgs.lib.escapeShellArg name} ${
+          pkgs.lib.escapeShellArg (builtins.toJSON ("$" + name))
+        } ${pkgs.lib.escapeShellArg (builtins.concatStringsSep "," maskedCredentials.${name})}\n"
+      ) (builtins.attrNames maskedCredentials)
+      + pkgs.lib.concatMapStrings (
         name:
         "declare_env ${pkgs.lib.escapeShellArg name} ${
           pkgs.lib.escapeShellArg (builtins.toJSON env.${name})
@@ -237,19 +294,22 @@ let
       publishedPorts,
       allowUnixSockets,
       proxyRedirects,
+      maskedCredentials,
     }:
     builtins.seq (assertNoLegacyArgs legacyArgs) (
       builtins.seq allowedHostPorts (
         builtins.seq publishedPorts (
           builtins.seq allowUnixSockets (
-            builtins.seq proxyRedirects (
-              pkgs.runCommand outName { } ''
-                mkdir -p $out/bin
-                install -m755 ${stub} $out/bin/${outName}
-              ''
-              // {
-                buildSpec = buildSpec;
-              }
+            builtins.seq maskedCredentials (
+              builtins.seq proxyRedirects (
+                pkgs.runCommand outName { } ''
+                  mkdir -p $out/bin
+                  install -m755 ${stub} $out/bin/${outName}
+                ''
+                // {
+                  buildSpec = buildSpec;
+                }
+              )
             )
           )
         )
@@ -265,6 +325,7 @@ in
   validatePublishedPorts = validatePublishedPorts;
   validateAllowUnixSockets = validateAllowUnixSockets;
   validateProxyRedirects = validateProxyRedirects;
+  validateMaskedCredentials = validateMaskedCredentials;
   preEntryScript = preEntryScript;
   launcherPackage = launcherPackage;
   mkImplicitPackages = mkImplicitPackages;

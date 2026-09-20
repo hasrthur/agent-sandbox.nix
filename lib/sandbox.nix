@@ -12,6 +12,8 @@
   roDirs ? [ ],
   roFiles ? [ ],
   env ? { },
+  # Environment variable name -> the hosts its value may be substituted for.
+  maskedCredentials ? { },
   allowedDomains ? null,
   allowedHostPorts ? [ ],
   publishedPorts ? [ ],
@@ -56,6 +58,11 @@ let
 
   validatedProxyRedirects = shared.validateProxyRedirects _proxyRedirects;
 
+  validatedMaskedCredentials = shared.validateMaskedCredentials {
+    maskedCredentials = maskedCredentials;
+    env = env;
+  };
+
   sandboxBuildSpec = import ./spec.nix
     {
       pkgs = pkgs;
@@ -86,6 +93,7 @@ let
   envFragment = shared.mkEnvFragment {
     outName = outName;
     env = env;
+    maskedCredentials = validatedMaskedCredentials;
   };
 
   stub = shared.mkStub {
@@ -109,4 +117,5 @@ shared.mkWrapper {
   publishedPorts = validatedPublishedPorts;
   allowUnixSockets = validatedAllowUnixSockets;
   proxyRedirects = validatedProxyRedirects;
+  maskedCredentials = validatedMaskedCredentials;
 }
