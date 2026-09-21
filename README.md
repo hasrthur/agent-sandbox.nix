@@ -402,6 +402,8 @@ SSH remotes (for example `git@github.com:...`) do not work by default. The sandb
 
 Some paths inside the git directory are read-only inside the sandbox: `hooks/`, `config`, `config.worktree`, `objects/info/alternates`, and the pointer files that record the location of a worktree's or a submodule's git directory. This is a security measure. See [Security](#what-it-protects-against).
 
+Read-only, not inert: the hooks you installed still run inside the sandbox, wherever in the repository you launched from, so a `pre-commit` check applies to the agent's commits as it does to yours.
+
 All other paths stay writable, so commits, fetches, branch switches and history reads work as normal. Two operations do not work:
 
 - `git config` cannot write to the repo config. Set repo-level config on the host instead.
